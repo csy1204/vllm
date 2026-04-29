@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vLLM Pooling/Reranker Attention Interactive Viz</title>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+  </script>
+  <style>
+    body { font-family: Inter, system-ui, sans-serif; margin: 0; background: #0b1020; color: #e6e9f2; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    h1, h2, h3 { margin: 0 0 12px; }
+    .sub { color: #b7bfdc; margin-bottom: 20px; }
+    .grid { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
+    .panel { background: #111932; border: 1px solid #26335f; border-radius: 14px; padding: 16px; }
+    button { width: 100%; margin: 8px 0; padding: 10px; border-radius: 10px; border: 1px solid #3a4a7a; background: #16214a; color: #fff; cursor: pointer; }
+    button.active { background: #3a63ff; border-color: #6f8bff; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; }
+    .good { background: #103f2a; color: #8af0b1; }
+    .warn { background: #4b2d0d; color: #ffd28e; }
+    .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { background: #0f1733; border: 1px solid #2b3a6b; border-radius: 12px; padding: 12px; }
+    .metric { font-size: 24px; font-weight: 700; }
+    .small { color: #aeb8db; font-size: 13px; }
+    .stage { display: none; }
+    .stage.active { display: block; }
+    ul { margin: 8px 0 0 20px; }
+    code { background: #1c274b; padding: 1px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>vLLM Pooling / Reranker / Embedding Attention 시각화</h1>
+    <p class="sub">단계별로 보면서, 왜 chat/decode 중심 파이프라인보다 pooling/reranker 경로가 <b>더 빠르고 효율적</b>일 수 있는지 비교합니다.</p>
+
+    <div class="grid">
+      <div class="panel">
+        <h3>Step Navigator</h3>
+        <button class="step-btn active" data-step="0">1) End-to-End 흐름</button>
+        <button class="step-btn" data-step="1">2) Encoder-only Attention 핵심</button>
+        <button class="step-btn" data-step="2">3) Late Interaction MaxSim</button>
+        <button class="step-btn" data-step="3">4) CUDA/Triton 최적화 포인트</button>
+        <button class="step-btn" data-step="4">5) 왜 더 빠른가 (설득 비교)</button>
+        <hr style="border-color:#2b3a6b; margin:14px 0;"/>
+        <span class="badge good">핵심 메시지</span>
+        <ul>
+          <li>Decode는 토큰 생성 루프 + KV 캐시 유지 비용이 큼</li>
+          <li>Pooling은 encoder-only + 집계 중심으로 경량화 가능</li>
+          <li>Late-interaction은 query 재활용으로 rerank 처리량 상승</li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <div id="stage-0" class="stage active">
+          <h2>1) End-to-End: Scoring/Reranking 요청 흐름</h2>
+          <div class="mermaid">
+flowchart LR
+  A[Client Request<br/>score / rerank / embed] --> B[ServingScores]
+  B --> C{flash late-interaction?}
+  C -- no --> D[Standard Pooling Path]
+  C -- yes --> E[Stage1: Encode Query<br/>Cache token embeddings]
+  E --> F[Stage2: Encode Docs<br/>Return scalar score]
+  D --> G[SequencePooler]
+  F --> G
+  G --> H[Response: score/relevance]
+          </div>
+        </div>
+
+        <div id="stage-1" class="stage">
+          <h2>2) Encoder-only Attention vs Decode Attention</h2>
+          <div class="cmp">
+            <div class="card">
+              <h3>Pooling/Reranker (Encoder-only)</h3>
+              <ul>
+                <li><code>causal=False</code> 양방향 attention</li>
+                <li>KV cache spec 불필요</li>
+                <li>출력 후 pool/head로 바로 집계</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>Chat/Decode</h3>
+              <ul>
+                <li>Auto-regressive 토큰 루프</li>
+                <li>KV cache 관리/이동/압축 비용</li>
+                <li>step-by-step latency 누적</li>
+              </ul>
+            </div>
+          </div>
+          <div class="mermaid">
+flowchart TD
+  X[Hidden States] --> Y[Encoder-only Attention]
+  Y --> Z[SequencePooler Method]
+  Z --> W[Embedding/Classification Head]
+  W --> O[Vector / Score]
+          </div>
+        </div>
+
+        <div id="stage-2" class="stage">
+          <h2>3) Late Interaction(MaxSim) 계산 단계</h2>
+          <div class="mermaid">
+flowchart LR
+  Q[Query token embeddings] --> M[Q x D^T]
+  D[Doc token embeddings] --> M
+  M --> K[Mask invalid doc tokens]
+  K --> T[Max over doc tokens<br/>per query token]
+  T --> S[Sum over query tokens]
+  S --> R[Final relevance score]
+          </div>
+          <p class="small">핵심은 query embedding을 cache해서 여러 doc에 재사용하는 점입니다.</p>
+        </div>
+
+        <div id="stage-3" class="stage">
+          <h2>4) CUDA/Triton 최적화 포인트</h2>
+          <div class="mermaid">
+flowchart TB
+  A1[Triton Unified Attention Kernel] --> A2[KV quant mode branch<br/>FP8/INT8/none]
+  A1 --> A3[Sliding/Chunked mask]
+  A1 --> A4[2D/3D segmented reduce]
+  B1[Decode Triton Kernel] --> B2[Split-KV reduction]
+  B1 --> B3[Paged KV access]
+  C1[CUDA cache_kernels.cu] --> C2[copy/swap blocks]
+  C1 --> C3[reshape_and_cache]
+          </div>
+        </div>
+
+        <div id="stage-4" class="stage">
+          <h2>5) 왜 더 좋고 빠른가 — 설득형 비교</h2>
+          <div class="cmp">
+            <div class="card">
+              <h3>기존 decode 중심 접근</h3>
+              <p class="metric">Higher</p>
+              <ul>
+                <li>토큰 생성 루프 latency</li>
+                <li>KV cache lifespan 길어짐</li>
+                <li>Long context에서 memory pressure 증가</li>
+              </ul>
+            </div>
+            <div class="card">
+              <h3>pooling/reranker 최적 경로</h3>
+              <p class="metric">Lower</p>
+              <ul>
+                <li>비생성(task) 특화 경로로 불필요 decode 제거</li>
+                <li>encoder-only attention + pool 집계</li>
+                <li>late-interaction query 재사용으로 docs 처리량 증가</li>
+              </ul>
+            </div>
+          </div>
+          <p><span class="badge warn">강조 포인트</span> “동일 GPU 시간에서 더 많은 문서 비교를 처리”하는 것이 reranking/embedding 서비스의 경쟁력입니다.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const buttons = document.querySelectorAll('.step-btn');
+    const stages = document.querySelectorAll('.stage');
+
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const step = btn.dataset.step;
+        buttons.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        stages.forEach(s => s.classList.remove('active'));
+        document.getElementById(`stage-${step}`).classList.add('active');
+      });
+    });
+  </script>
+</body>
+</html>
